@@ -1,7 +1,7 @@
 """
 Spawner Price Logger — Phase 2
 Watches configured channels, logs every message + embed to Postgres,
-and extracts skeleton spawner prices into spawner_prices table.
+extracts skeleton spawner prices, and updates on message edits.
 """
 
 import os
@@ -25,56 +25,93 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 with open("config.json") as f:
     _cfg = json.load(f)
 
-CHANNEL_IDS:     set[int]        = {int(ch["id"]) for ch in _cfg["channels"]}
-CHANNEL_LABELS:  dict[int, str]  = {int(ch["id"]): ch["label"] for ch in _cfg["channels"]}
+CHANNEL_IDS:      set[int]       = {int(ch["id"]) for ch in _cfg["channels"]}
+CHANNEL_LABELS:   dict[int, str] = {int(ch["id"]): ch["label"] for ch in _cfg["channels"]}
 HISTORY_CHANNELS: set[int]       = {int(ch["id"]) for ch in _cfg["channels"] if ch.get("check_history")}
 
 # ── Skeleton spawner price extraction ────────────────────────────────────────
-# Matches patterns like:
-#   "Skeleton Spawner - $12,500"
-#   "skeleton spawner x1 | 8500"
-#   "1x Skeleton Spawner 12500"
-#   "[Skeleton Spawner] Price: 15,000"
-#   "Selling skeleton spawner for 9k"
+#
+# Handles both directions:
+#   AFTER:  "Skeleton Spawner - $12,500"
+#           "skeleton spawner x1 | 8.5k"
+#   BEFORE: "WE PAY 4.4M PER SKELETON SPAWNER"
+#           "## WE PAY **4.6M** PER SKELETON SPAWNER"
+#           "selling 9k skeleton spawner"
+#
+# Multipliers: k (×1000), m (×1,000,000)
+# Markdown bold stripped before matching.
 
-_SKELETON_RE = re.compile(
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+
+# Price-AFTER pattern: skeleton spawner [filler] PRICE[k/m]
+_AFTER_RE = re.compile(
     r"""
-    (?:^|\b)                          # word boundary or line start
-    (?:\d+\s*[xX×]\s*)?               # optional quantity: "3x", "1 x"
-    skeleton\s+spawner                # the thing we care about
-    (?:\s*[xX×]\s*\d+)?               # or quantity after
-    [^\d$]*?                          # any filler (type, dash, pipe, colon...)
-    [\$]?                             # optional dollar sign
-    ([\d,]+(?:\.\d+)?)                # PRICE — digits with optional commas/decimal
-    \s*(?:k\b)?                       # optional "k" multiplier
+    \bskeleton\s+spawner\b
+    [^\d$]*?                          # filler (dash, pipe, colon, spaces…)
+    \$?([\d,]+(?:\.\d+)?)             # price digits
+    \s*([km])\b                       # multiplier
+    |
+    \bskeleton\s+spawner\b
+    [^\d$]*?
+    \$?([\d,]+(?:\.\d+)?)             # price with no multiplier
+    (?!\s*[km]\b)
     """,
     re.IGNORECASE | re.VERBOSE,
 )
 
-_K_RE = re.compile(r"([\d,]+(?:\.\d+)?)\s*k\b", re.IGNORECASE)
+# Price-BEFORE pattern: PRICE[k/m] [per/for/each/of] skeleton spawner
+_BEFORE_RE = re.compile(
+    r"""
+    \$?([\d,]+(?:\.\d+)?)             # price digits
+    \s*([km])\b                       # multiplier required (4.4M, 9k, etc.)
+    \s*(?:per|for|each|of|/)?         # optional connector
+    \s*\bskeleton\s+spawner\b
+    |
+    \$?([\d,]+(?:\.\d+)?)             # price without multiplier
+    (?!\s*[km]\b)
+    \s*(?:per|for|each|of|/)
+    \s*\bskeleton\s+spawner\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _parse_price(digits: str, multiplier: str | None) -> int:
+    value = float(digits.replace(",", ""))
+    if multiplier:
+        mul = multiplier.lower()
+        if mul == "k":
+            value *= 1_000
+        elif mul == "m":
+            value *= 1_000_000
+    return int(value)
 
 
 def _extract_skeleton_price(text: str) -> int | None:
-    """Return the first skeleton spawner price found in text, or None."""
     if not text:
         return None
-    m = _SKELETON_RE.search(text)
-    if not m:
-        return None
-    raw = m.group(1).replace(",", "")
-    # check if the original match had a trailing "k"
-    full_match = m.group(0)
-    try:
-        value = float(raw)
-        if re.search(r"\d\s*k\b", full_match, re.IGNORECASE):
-            value *= 1000
-        return int(value)
-    except ValueError:
-        return None
+    # strip markdown bold so **4.6M** becomes 4.6M
+    text = _BOLD_RE.sub(r"\1", text)
+
+    # try before pattern first (more specific)
+    m = _BEFORE_RE.search(text)
+    if m:
+        if m.group(1):
+            return _parse_price(m.group(1), m.group(2))
+        if m.group(3):
+            return _parse_price(m.group(3), None)
+
+    m = _AFTER_RE.search(text)
+    if m:
+        if m.group(1):
+            return _parse_price(m.group(1), m.group(2))
+        if m.group(3):
+            return _parse_price(m.group(3), None)
+
+    return None
 
 
-def _extract_skeleton_price_from_entry(entry: dict) -> int | None:
-    """Check content + all embed fields for a skeleton spawner price."""
+def _extract_from_entry(entry: dict) -> int | None:
     price = _extract_skeleton_price(entry.get("content") or "")
     if price:
         return price
@@ -84,12 +121,10 @@ def _extract_skeleton_price_from_entry(entry: dict) -> int | None:
             if price:
                 return price
         for ef in embed.get("fields") or []:
-            price = _extract_skeleton_price(ef.get("value") or "")
-            if price:
-                return price
-            price = _extract_skeleton_price(ef.get("name") or "")
-            if price:
-                return price
+            for key in ("value", "name"):
+                price = _extract_skeleton_price(ef.get(key) or "")
+                if price:
+                    return price
     return None
 
 
@@ -111,8 +146,10 @@ async def _init_tables(pool: asyncpg.Pool) -> None:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS raw_price_log (
                 id          BIGSERIAL PRIMARY KEY,
+                message_id  BIGINT UNIQUE,
                 source      TEXT NOT NULL,
                 logged_at   TIMESTAMPTZ DEFAULT NOW(),
+                updated_at  TIMESTAMPTZ DEFAULT NOW(),
                 guild       TEXT,
                 guild_id    BIGINT,
                 channel     TEXT,
@@ -124,33 +161,68 @@ async def _init_tables(pool: asyncpg.Pool) -> None:
                 embeds      JSONB
             )
         """)
+        # add message_id column if upgrading from old schema
+        await conn.execute("""
+            ALTER TABLE raw_price_log
+            ADD COLUMN IF NOT EXISTS message_id BIGINT UNIQUE
+        """)
+        await conn.execute("""
+            ALTER TABLE raw_price_log
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+        """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS spawner_prices (
-                id          BIGSERIAL PRIMARY KEY,
-                logged_at   TIMESTAMPTZ DEFAULT NOW(),
-                channel_id  BIGINT NOT NULL,
+                id           BIGSERIAL PRIMARY KEY,
+                logged_at    TIMESTAMPTZ DEFAULT NOW(),
+                updated_at   TIMESTAMPTZ DEFAULT NOW(),
+                channel_id   BIGINT NOT NULL,
                 server_label TEXT,
-                price       BIGINT NOT NULL,
-                raw_log_id  BIGINT REFERENCES raw_price_log(id)
+                price        BIGINT NOT NULL,
+                raw_log_id   BIGINT REFERENCES raw_price_log(id)
             )
+        """)
+        await conn.execute("""
+            ALTER TABLE spawner_prices
+            ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
         """)
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_spawner_prices_logged_at
             ON spawner_prices (logged_at DESC)
         """)
+        await conn.execute("""
+            ALTER TABLE spawner_prices
+            ADD COLUMN IF NOT EXISTS raw_log_id BIGINT REFERENCES raw_price_log(id)
+        """)
+        # unique constraint so ON CONFLICT (raw_log_id) works
+        await conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_spawner_prices_raw_log_id
+            ON spawner_prices (raw_log_id)
+            WHERE raw_log_id IS NOT NULL
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_raw_price_log_message_id
+            ON raw_price_log (message_id)
+            WHERE message_id IS NOT NULL
+        """)
     log.info("DB tables ready.")
 
 
-async def _insert_entry(entry: dict) -> int:
+async def _upsert_entry(entry: dict) -> int:
+    """Insert or update raw_price_log by message_id. Returns the row id."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         row_id = await conn.fetchval("""
             INSERT INTO raw_price_log
-                (source, guild, guild_id, channel, channel_id,
+                (message_id, source, guild, guild_id, channel, channel_id,
                  author, author_id, is_bot, content, embeds)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            ON CONFLICT (message_id) DO UPDATE SET
+                content    = EXCLUDED.content,
+                embeds     = EXCLUDED.embeds,
+                updated_at = NOW()
             RETURNING id
         """,
+            entry.get("message_id"),
             entry["source"],
             entry["guild"],
             entry["guild_id"],
@@ -165,13 +237,24 @@ async def _insert_entry(entry: dict) -> int:
         return row_id
 
 
-async def _insert_price(channel_id: int, label: str, price: int, log_id: int) -> None:
+async def _upsert_price(channel_id: int, label: str, price: int, log_id: int) -> None:
+    """Insert or update spawner_prices keyed by raw_log_id."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO spawner_prices (channel_id, server_label, price, raw_log_id)
             VALUES ($1, $2, $3, $4)
+            ON CONFLICT (raw_log_id) DO UPDATE SET
+                price      = EXCLUDED.price,
+                updated_at = NOW()
         """, channel_id, label, price, log_id)
+
+
+async def _delete_price(log_id: int) -> None:
+    """Remove a price entry if an edited message no longer has a skeleton price."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM spawner_prices WHERE raw_log_id = $1", log_id)
 
 
 # ── Discord client ────────────────────────────────────────────────────────────
@@ -191,6 +274,7 @@ def _serialize_embed(embed: discord.Embed) -> dict:
 
 def _build_entry(message: discord.Message, source: str = "live") -> dict:
     return {
+        "message_id": message.id,
         "source":     source,
         "guild":      str(message.guild) if message.guild else "DM",
         "guild_id":   message.guild.id if message.guild else None,
@@ -204,19 +288,21 @@ def _build_entry(message: discord.Message, source: str = "live") -> dict:
     }
 
 
-async def _process(entry: dict) -> None:
-    label  = CHANNEL_LABELS.get(entry["channel_id"], str(entry["channel_id"]))
-    kind   = "EMBED" if entry["embeds"] else "MSG"
+async def _process(entry: dict, event: str = "new") -> None:
+    label   = CHANNEL_LABELS.get(entry["channel_id"], str(entry["channel_id"]))
+    kind    = "EMBED" if entry["embeds"] else "MSG"
     preview = (entry["content"] or "(no content)")[:80]
 
-    log_id = await _insert_entry(entry)
+    log_id = await _upsert_entry(entry)
+    price  = _extract_from_entry(entry)
 
-    price = _extract_skeleton_price_from_entry(entry)
     if price:
-        await _insert_price(entry["channel_id"], label, price, log_id)
-        log.info("[%s] %s — SKELETON PRICE FOUND: $%s | %s", label, kind, f"{price:,}", preview)
+        await _upsert_price(entry["channel_id"], label, price, log_id)
+        log.info("[%s] %s %s — SKELETON PRICE: $%s | %s", label, event.upper(), kind, f"{price:,}", preview)
     else:
-        log.info("[%s] %s: %s", label, kind, preview)
+        if event == "edit":
+            await _delete_price(log_id)
+        log.info("[%s] %s %s: %s", label, event.upper(), kind, preview)
 
 
 client = discord.Client()
@@ -230,7 +316,6 @@ async def on_ready():
         flag = " [history]" if cid in HISTORY_CHANNELS else ""
         log.info("  %s — %s%s", cid, label, flag)
 
-    # ensure DB is ready before processing history
     await get_pool()
 
     for cid in HISTORY_CHANNELS:
@@ -240,14 +325,21 @@ async def on_ready():
             continue
         log.info("Fetching last 2 messages from %s...", CHANNEL_LABELS.get(cid, cid))
         async for message in channel.history(limit=2):
-            await _process(_build_entry(message, source="history"))
+            await _process(_build_entry(message, source="history"), event="history")
 
 
 @client.event
 async def on_message(message: discord.Message):
     if message.channel.id not in CHANNEL_IDS:
         return
-    await _process(_build_entry(message, source="live"))
+    await _process(_build_entry(message, source="live"), event="new")
+
+
+@client.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if after.channel.id not in CHANNEL_IDS:
+        return
+    await _process(_build_entry(after, source="edit"), event="edit")
 
 
 client.run(TOKEN)
