@@ -433,11 +433,11 @@ async def on_ready():
         if channel is None:
             log.warning("Could not find history channel %s", cid)
             continue
-        log.info("Fetching last 2 messages from %s...", CHANNEL_LABELS.get(cid, cid))
-        async for message in channel.history(limit=2):
+        log.info("Fetching last 10 messages from %s...", CHANNEL_LABELS.get(cid, cid))
+        async for message in channel.history(limit=10):
             entry = _build_entry(message, source="history")
             await _process(entry, event="history")
-            # stop if latest message already has both prices
+            # stop if we already have both prices from this message
             prices = _extract_from_entry(entry)
             if prices["buy_price"] and prices["sell_price"]:
                 break
