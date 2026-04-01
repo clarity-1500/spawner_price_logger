@@ -2,22 +2,22 @@
   "channels": [
     {
       "id": 1392543634678611968,
-      "label": "Server 1",
+      "label": "20B | DonutSMP Marketplace",
       "check_history": false
     },
     {
       "id": 1414759023902986294,
-      "label": "Server 2",
+      "label": "2B RN - Donut Orbit | Best Spawner Prices",
       "check_history": false
     },
     {
       "id": 1373579452998746155,
-      "label": "Server 3",
+      "label": "Adlantis x Ravvix SMP",
       "check_history": false
     },
     {
       "id": 1198679856544755804,
-      "label": "Server 4 (no deletes — check latest 2 messages)",
+      "label": "DonutSMP Giveaways",
       "check_history": true
     }
   ]

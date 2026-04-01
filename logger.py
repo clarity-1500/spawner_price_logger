@@ -1,7 +1,11 @@
 """
-Spawner Price Logger — Phase 2
+Spawner Price Logger — Phase 3
 Watches configured channels, logs every message + embed to Postgres,
-extracts skeleton spawner prices, and updates on message edits.
+extracts skeleton spawner buy/sell prices, and updates on message edits.
+
+Prices are stored from a MEMBER'S perspective:
+  buy_price  — what a member pays to BUY FROM the server  (e.g. "WE SELL FOR 5.3M")
+  sell_price — what a member gets when SELLING TO the server (e.g. "WE PAY 4.4M")
 """
 
 import os
@@ -31,43 +35,95 @@ HISTORY_CHANNELS: set[int]       = {int(ch["id"]) for ch in _cfg["channels"] if 
 
 # ── Skeleton spawner price extraction ────────────────────────────────────────
 #
-# Handles both directions:
-#   AFTER:  "Skeleton Spawner - $12,500"
-#           "skeleton spawner x1 | 8.5k"
-#   BEFORE: "WE PAY 4.4M PER SKELETON SPAWNER"
-#           "## WE PAY **4.6M** PER SKELETON SPAWNER"
-#           "selling 9k skeleton spawner"
+# Dual-direction extraction (member perspective):
+#
+#   sell_price (member sells TO server, server pays member):
+#     "WE PAY 4.4M PER SKELETON SPAWNER"
+#     "WE PAY **4.6M** PER SKELETON SPAWNER"
+#
+#   buy_price (member buys FROM server, server sells to member):
+#     "WE SELL SKELETON SPAWNERS TO YOU FOR 5.3M PER SPAWNER"
+#     "WE SELL SKELETON SPAWNERS FOR 5.3M"
+#
+#   Generic (direction unknown — stored as sell_price):
+#     "Skeleton Spawner - $12,500"
+#     "skeleton spawner x1 | 8.5k"
+#     "selling 9k skeleton spawner"
 #
 # Multipliers: k (×1000), m (×1,000,000)
 # Markdown bold stripped before matching.
 
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 
-# Price-AFTER pattern: skeleton spawner [filler] PRICE[k/m]
-_AFTER_RE = re.compile(
+# "WE PAY X per skeleton spawner" → sell_price
+_SELL_RE = re.compile(
     r"""
-    \bskeleton\s+spawner\b
-    [^\d$]*?                          # filler (dash, pipe, colon, spaces…)
-    \$?([\d,]+(?:\.\d+)?)             # price digits
-    \s*([km])\b                       # multiplier
+    \bwe\s+pay\b
+    \s+
+    \$?([\d,]+(?:\.\d+)?)          # digits
+    \s*([km])\b                     # multiplier
+    \s*(?:per|for|each|of|/)?
+    \s*\bskeleton\s+spawner\b
     |
+    \bwe\s+pay\b
+    \s+
+    \$?([\d,]+(?:\.\d+)?)          # digits (no multiplier)
+    (?!\s*[km]\b)
+    \s*(?:per|for|each|of|/)
+    \s*\bskeleton\s+spawner\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# "WE SELL SKELETON SPAWNERS (TO YOU)? FOR X" → buy_price
+_BUY_RE = re.compile(
+    r"""
+    \bwe\s+sell\b
+    .*?
     \bskeleton\s+spawner\b
-    [^\d$]*?
-    \$?([\d,]+(?:\.\d+)?)             # price with no multiplier
+    .*?
+    \bfor\b
+    \s+
+    \$?([\d,]+(?:\.\d+)?)          # digits
+    \s*([km])\b                     # multiplier
+    |
+    \bwe\s+sell\b
+    .*?
+    \bskeleton\s+spawner\b
+    .*?
+    \bfor\b
+    \s+
+    \$?([\d,]+(?:\.\d+)?)          # digits (no multiplier)
     (?!\s*[km]\b)
     """,
     re.IGNORECASE | re.VERBOSE,
 )
 
-# Price-BEFORE pattern: PRICE[k/m] [per/for/each/of] skeleton spawner
+# Generic price-AFTER: skeleton spawner [filler] PRICE[k/m]
+_AFTER_RE = re.compile(
+    r"""
+    \bskeleton\s+spawner\b
+    [^\d$]*?
+    \$?([\d,]+(?:\.\d+)?)
+    \s*([km])\b
+    |
+    \bskeleton\s+spawner\b
+    [^\d$]*?
+    \$?([\d,]+(?:\.\d+)?)
+    (?!\s*[km]\b)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Generic price-BEFORE: PRICE[k/m] [connector] skeleton spawner
 _BEFORE_RE = re.compile(
     r"""
-    \$?([\d,]+(?:\.\d+)?)             # price digits
-    \s*([km])\b                       # multiplier required (4.4M, 9k, etc.)
-    \s*(?:per|for|each|of|/)?         # optional connector
+    \$?([\d,]+(?:\.\d+)?)
+    \s*([km])\b
+    \s*(?:per|for|each|of|/)?
     \s*\bskeleton\s+spawner\b
     |
-    \$?([\d,]+(?:\.\d+)?)             # price without multiplier
+    \$?([\d,]+(?:\.\d+)?)
     (?!\s*[km]\b)
     \s*(?:per|for|each|of|/)
     \s*\bskeleton\s+spawner\b
@@ -87,45 +143,75 @@ def _parse_price(digits: str, multiplier: str | None) -> int:
     return int(value)
 
 
-def _extract_skeleton_price(text: str) -> int | None:
+def _extract_prices(text: str) -> dict[str, int | None]:
+    """
+    Returns {"buy_price": int|None, "sell_price": int|None}.
+    buy_price  = member buys FROM server
+    sell_price = member sells TO server
+    """
     if not text:
-        return None
-    # strip markdown bold so **4.6M** becomes 4.6M
+        return {"buy_price": None, "sell_price": None}
+
     text = _BOLD_RE.sub(r"\1", text)
 
-    # try before pattern first (more specific)
-    m = _BEFORE_RE.search(text)
+    buy_price  = None
+    sell_price = None
+
+    # Try directional patterns first
+    m = _SELL_RE.search(text)
     if m:
         if m.group(1):
-            return _parse_price(m.group(1), m.group(2))
-        if m.group(3):
-            return _parse_price(m.group(3), None)
+            sell_price = _parse_price(m.group(1), m.group(2))
+        elif m.group(3):
+            sell_price = _parse_price(m.group(3), None)
 
-    m = _AFTER_RE.search(text)
+    m = _BUY_RE.search(text)
     if m:
         if m.group(1):
-            return _parse_price(m.group(1), m.group(2))
-        if m.group(3):
-            return _parse_price(m.group(3), None)
+            buy_price = _parse_price(m.group(1), m.group(2))
+        elif m.group(3):
+            buy_price = _parse_price(m.group(3), None)
 
-    return None
+    # If neither directional pattern fired, fall back to generic → sell_price
+    if buy_price is None and sell_price is None:
+        m = _BEFORE_RE.search(text)
+        if m:
+            if m.group(1):
+                sell_price = _parse_price(m.group(1), m.group(2))
+            elif m.group(3):
+                sell_price = _parse_price(m.group(3), None)
+
+        if sell_price is None:
+            m = _AFTER_RE.search(text)
+            if m:
+                if m.group(1):
+                    sell_price = _parse_price(m.group(1), m.group(2))
+                elif m.group(3):
+                    sell_price = _parse_price(m.group(3), None)
+
+    return {"buy_price": buy_price, "sell_price": sell_price}
 
 
-def _extract_from_entry(entry: dict) -> int | None:
-    price = _extract_skeleton_price(entry.get("content") or "")
-    if price:
-        return price
+def _extract_from_entry(entry: dict) -> dict[str, int | None]:
+    """Scan content + all embed fields, merge buy/sell across all sources."""
+    result: dict[str, int | None] = {"buy_price": None, "sell_price": None}
+
+    def _merge(prices: dict) -> None:
+        if prices["buy_price"]  and result["buy_price"]  is None:
+            result["buy_price"]  = prices["buy_price"]
+        if prices["sell_price"] and result["sell_price"] is None:
+            result["sell_price"] = prices["sell_price"]
+
+    _merge(_extract_prices(entry.get("content") or ""))
+
     for embed in entry.get("embeds") or []:
         for field in ["title", "description", "footer", "author"]:
-            price = _extract_skeleton_price(embed.get(field) or "")
-            if price:
-                return price
+            _merge(_extract_prices(embed.get(field) or ""))
         for ef in embed.get("fields") or []:
             for key in ("value", "name"):
-                price = _extract_skeleton_price(ef.get(key) or "")
-                if price:
-                    return price
-    return None
+                _merge(_extract_prices(ef.get(key) or ""))
+
+    return result
 
 
 # ── DB ────────────────────────────────────────────────────────────────────────
@@ -161,7 +247,6 @@ async def _init_tables(pool: asyncpg.Pool) -> None:
                 embeds      JSONB
             )
         """)
-        # add message_id column if upgrading from old schema
         await conn.execute("""
             ALTER TABLE raw_price_log
             ADD COLUMN IF NOT EXISTS message_id BIGINT UNIQUE
@@ -177,23 +262,32 @@ async def _init_tables(pool: asyncpg.Pool) -> None:
                 updated_at   TIMESTAMPTZ DEFAULT NOW(),
                 channel_id   BIGINT NOT NULL,
                 server_label TEXT,
-                price        BIGINT NOT NULL,
+                buy_price    BIGINT,
+                sell_price   BIGINT,
                 raw_log_id   BIGINT REFERENCES raw_price_log(id)
             )
+        """)
+        # migrate old schema: add new columns, keep old price col untouched
+        await conn.execute("""
+            ALTER TABLE spawner_prices
+            ADD COLUMN IF NOT EXISTS buy_price BIGINT
+        """)
+        await conn.execute("""
+            ALTER TABLE spawner_prices
+            ADD COLUMN IF NOT EXISTS sell_price BIGINT
         """)
         await conn.execute("""
             ALTER TABLE spawner_prices
             ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
         """)
         await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_spawner_prices_logged_at
-            ON spawner_prices (logged_at DESC)
-        """)
-        await conn.execute("""
             ALTER TABLE spawner_prices
             ADD COLUMN IF NOT EXISTS raw_log_id BIGINT REFERENCES raw_price_log(id)
         """)
-        # drop old partial index if it exists, recreate as full unique index
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_spawner_prices_logged_at
+            ON spawner_prices (logged_at DESC)
+        """)
         await conn.execute("DROP INDEX IF EXISTS idx_spawner_prices_raw_log_id")
         await conn.execute("""
             CREATE UNIQUE INDEX idx_spawner_prices_raw_log_id
@@ -237,21 +331,23 @@ async def _upsert_entry(entry: dict) -> int:
         return row_id
 
 
-async def _upsert_price(channel_id: int, label: str, price: int, log_id: int) -> None:
+async def _upsert_price(channel_id: int, label: str, buy_price: int | None,
+                        sell_price: int | None, log_id: int) -> None:
     """Insert or update spawner_prices keyed by raw_log_id."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO spawner_prices (channel_id, server_label, price, raw_log_id)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO spawner_prices (channel_id, server_label, buy_price, sell_price, raw_log_id)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (raw_log_id) DO UPDATE SET
-                price      = EXCLUDED.price,
+                buy_price  = EXCLUDED.buy_price,
+                sell_price = EXCLUDED.sell_price,
                 updated_at = NOW()
-        """, channel_id, label, price, log_id)
+        """, channel_id, label, buy_price, sell_price, log_id)
 
 
 async def _delete_price(log_id: int) -> None:
-    """Remove a price entry if an edited message no longer has a skeleton price."""
+    """Remove a price entry if an edited message no longer has any skeleton price."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM spawner_prices WHERE raw_log_id = $1", log_id)
@@ -294,11 +390,19 @@ async def _process(entry: dict, event: str = "new") -> None:
     preview = (entry["content"] or "(no content)")[:80]
 
     log_id = await _upsert_entry(entry)
-    price  = _extract_from_entry(entry)
+    prices = _extract_from_entry(entry)
+    buy    = prices["buy_price"]
+    sell   = prices["sell_price"]
 
-    if price:
-        await _upsert_price(entry["channel_id"], label, price, log_id)
-        log.info("[%s] %s %s — SKELETON PRICE: $%s | %s", label, event.upper(), kind, f"{price:,}", preview)
+    if buy or sell:
+        await _upsert_price(entry["channel_id"], label, buy, sell, log_id)
+        parts = []
+        if buy:
+            parts.append(f"BUY ${buy:,}")
+        if sell:
+            parts.append(f"SELL ${sell:,}")
+        log.info("[%s] %s %s — SKELETON PRICE: %s | %s",
+                 label, event.upper(), kind, " | ".join(parts), preview)
     else:
         if event == "edit":
             await _delete_price(log_id)
