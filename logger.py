@@ -99,36 +99,23 @@ _BUY_RE = re.compile(
     re.IGNORECASE | re.VERBOSE | re.DOTALL,
 )
 
-# Generic price-AFTER: skeleton spawner [filler] PRICE[k/m]
+# Section headers: "Buying: (You Sell To Us)" / "Selling: (We Sell To You)"
+# Used to split embed text into directional zones before generic extraction.
+_BUYING_HDR_RE  = re.compile(r"(?:^|\n)\s*buying\b", re.IGNORECASE)
+_SELLING_HDR_RE = re.compile(r"(?:^|\n)\s*selling\b", re.IGNORECASE)
+
+# Generic price-AFTER: skeleton spawner[s] <same-line filler> PRICE[k/m]
 _AFTER_RE = re.compile(
-    r"""
-    \bskeleton\s+spawners?\b
-    [^\d$]*?
-    \$?([\d,]+(?:\.\d+)?)
-    \s*([km])\b
-    |
-    \bskeleton\s+spawners?\b
-    [^\d$]*?
-    \$?([\d,]+(?:\.\d+)?)
-    (?!\s*[km]\b)
-    """,
-    re.IGNORECASE | re.VERBOSE,
+    r"skeleton spawners?[^\d\n]{0,30}([\d,]+(?:\.\d+)?)\s*([km])\b"
+    r"|skeleton spawners?[^\d\n]{0,30}([\d,]+(?:\.\d+)?)(?!\s*[km]\b)",
+    re.IGNORECASE,
 )
 
-# Generic price-BEFORE: PRICE[k/m] [connector] skeleton spawner
+# Generic price-BEFORE: PRICE[k/m] <no-newline connector> skeleton spawner[s]
 _BEFORE_RE = re.compile(
-    r"""
-    \$?([\d,]+(?:\.\d+)?)
-    \s*([km])\b
-    \s*(?:per|for|each|of|/)?
-    \s*\bskeleton\s+spawners?\b
-    |
-    \$?([\d,]+(?:\.\d+)?)
-    (?!\s*[km]\b)
-    \s*(?:per|for|each|of|/)
-    \s*\bskeleton\s+spawners?\b
-    """,
-    re.IGNORECASE | re.VERBOSE,
+    r"([\d,]+(?:\.\d+)?)\s*([km])\b[^\n]{0,20}skeleton spawners?"
+    r"|([\d,]+(?:\.\d+)?)(?!\s*[km]\b)[^\n]{0,10}skeleton spawners?",
+    re.IGNORECASE,
 )
 
 
@@ -141,6 +128,48 @@ def _parse_price(digits: str, multiplier: str | None) -> int:
         elif mul == "m":
             value *= 1_000_000
     return int(value)
+
+
+def _generic_skeleton_price(text: str) -> int | None:
+    """Return the first skeleton spawner price found in text (no directionality).
+    AFTER pattern tried first — handles listing-style 'Skeleton Spawners 4.85m each'.
+    """
+    m = _AFTER_RE.search(text)
+    if m:
+        if m.group(1): return _parse_price(m.group(1), m.group(2))
+        if m.group(3): return _parse_price(m.group(3), None)
+    m = _BEFORE_RE.search(text)
+    if m:
+        if m.group(1): return _parse_price(m.group(1), m.group(2))
+        if m.group(3): return _parse_price(m.group(3), None)
+    return None
+
+
+def _extract_prices_sectioned(text: str) -> dict[str, int | None]:
+    """
+    Handles embeds with 'Buying:' / 'Selling:' section headers.
+      Buying section (you sell to us)  → sell_price
+      Selling section (we sell to you) → buy_price
+    Returns {buy_price, sell_price} or both None if no headers found.
+    """
+    buy_m  = _BUYING_HDR_RE.search(text)
+    sell_m = _SELLING_HDR_RE.search(text)
+    if not buy_m and not sell_m:
+        return {"buy_price": None, "sell_price": None}
+
+    sell_price = None
+    buy_price  = None
+
+    if buy_m:
+        end = sell_m.start() if sell_m and sell_m.start() > buy_m.start() else len(text)
+        sell_price = _generic_skeleton_price(text[buy_m.start():end])
+
+    if sell_m:
+        # make sure we're reading the selling section that comes after buying
+        start = sell_m.start()
+        buy_price = _generic_skeleton_price(text[start:])
+
+    return {"buy_price": buy_price, "sell_price": sell_price}
 
 
 def _extract_prices(text: str) -> dict[str, int | None]:
@@ -172,22 +201,15 @@ def _extract_prices(text: str) -> dict[str, int | None]:
         elif m.group(3):
             buy_price = _parse_price(m.group(3), None)
 
-    # If neither directional pattern fired, fall back to generic → sell_price
-    if buy_price is None and sell_price is None:
-        m = _BEFORE_RE.search(text)
-        if m:
-            if m.group(1):
-                sell_price = _parse_price(m.group(1), m.group(2))
-            elif m.group(3):
-                sell_price = _parse_price(m.group(3), None)
+    # Try sectioned embed format: "Buying: (You Sell To Us)" / "Selling: (We Sell To You)"
+    if buy_price is None or sell_price is None:
+        sectioned = _extract_prices_sectioned(text)
+        if buy_price  is None: buy_price  = sectioned["buy_price"]
+        if sell_price is None: sell_price = sectioned["sell_price"]
 
-        if sell_price is None:
-            m = _AFTER_RE.search(text)
-            if m:
-                if m.group(1):
-                    sell_price = _parse_price(m.group(1), m.group(2))
-                elif m.group(3):
-                    sell_price = _parse_price(m.group(3), None)
+    # Generic fallback — direction unknown, store as sell_price
+    if buy_price is None and sell_price is None:
+        sell_price = _generic_skeleton_price(text)
 
     return {"buy_price": buy_price, "sell_price": sell_price}
 
