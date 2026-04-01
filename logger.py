@@ -63,14 +63,14 @@ _SELL_RE = re.compile(
     \$?([\d,]+(?:\.\d+)?)          # digits
     \s*([km])\b                     # multiplier
     \s*(?:per|for|each|of|/)?
-    \s*\bskeleton\s+spawner\b
+    \s*\bskeleton\s+spawners?\b
     |
     \bwe\s+pay\b
     \s+
     \$?([\d,]+(?:\.\d+)?)          # digits (no multiplier)
     (?!\s*[km]\b)
     \s*(?:per|for|each|of|/)
-    \s*\bskeleton\s+spawner\b
+    \s*\bskeleton\s+spawners?\b
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -80,7 +80,7 @@ _BUY_RE = re.compile(
     r"""
     \bwe\s+sell\b
     .*?
-    \bskeleton\s+spawner\b
+    \bskeleton\s+spawners?\b
     .*?
     \bfor\b
     \s+
@@ -89,25 +89,25 @@ _BUY_RE = re.compile(
     |
     \bwe\s+sell\b
     .*?
-    \bskeleton\s+spawner\b
+    \bskeleton\s+spawners?\b
     .*?
     \bfor\b
     \s+
     \$?([\d,]+(?:\.\d+)?)          # digits (no multiplier)
     (?!\s*[km]\b)
     """,
-    re.IGNORECASE | re.VERBOSE,
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
 )
 
 # Generic price-AFTER: skeleton spawner [filler] PRICE[k/m]
 _AFTER_RE = re.compile(
     r"""
-    \bskeleton\s+spawner\b
+    \bskeleton\s+spawners?\b
     [^\d$]*?
     \$?([\d,]+(?:\.\d+)?)
     \s*([km])\b
     |
-    \bskeleton\s+spawner\b
+    \bskeleton\s+spawners?\b
     [^\d$]*?
     \$?([\d,]+(?:\.\d+)?)
     (?!\s*[km]\b)
@@ -121,12 +121,12 @@ _BEFORE_RE = re.compile(
     \$?([\d,]+(?:\.\d+)?)
     \s*([km])\b
     \s*(?:per|for|each|of|/)?
-    \s*\bskeleton\s+spawner\b
+    \s*\bskeleton\s+spawners?\b
     |
     \$?([\d,]+(?:\.\d+)?)
     (?!\s*[km]\b)
     \s*(?:per|for|each|of|/)
-    \s*\bskeleton\s+spawner\b
+    \s*\bskeleton\s+spawners?\b
     """,
     re.IGNORECASE | re.VERBOSE,
 )
