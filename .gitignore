@@ -1,0 +1,4 @@
+.env
+price_log.jsonl
+__pycache__/
+*.pyc

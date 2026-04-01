@@ -1,0 +1,12 @@
+{
+  "channels": [
+    {
+      "id": 000000000000000000,
+      "label": "Server 1 — #spawner-prices"
+    },
+    {
+      "id": 000000000000000000,
+      "label": "Server 2 — #trading"
+    }
+  ]
+}
