@@ -193,9 +193,10 @@ async def _init_tables(pool: asyncpg.Pool) -> None:
             ALTER TABLE spawner_prices
             ADD COLUMN IF NOT EXISTS raw_log_id BIGINT REFERENCES raw_price_log(id)
         """)
-        # unique constraint so ON CONFLICT (raw_log_id) works
+        # drop old partial index if it exists, recreate as full unique index
+        await conn.execute("DROP INDEX IF EXISTS idx_spawner_prices_raw_log_id")
         await conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_spawner_prices_raw_log_id
+            CREATE UNIQUE INDEX idx_spawner_prices_raw_log_id
             ON spawner_prices (raw_log_id)
         """)
         await conn.execute("""
