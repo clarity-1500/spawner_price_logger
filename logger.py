@@ -267,7 +267,11 @@ async def _init_tables(pool: asyncpg.Pool) -> None:
                 raw_log_id   BIGINT REFERENCES raw_price_log(id)
             )
         """)
-        # migrate old schema: add new columns, keep old price col untouched
+        # migrate old schema: drop NOT NULL on legacy price col, add buy/sell cols
+        await conn.execute("""
+            ALTER TABLE spawner_prices
+            ALTER COLUMN price DROP NOT NULL
+        """)
         await conn.execute("""
             ALTER TABLE spawner_prices
             ADD COLUMN IF NOT EXISTS buy_price BIGINT
