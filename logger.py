@@ -513,7 +513,7 @@ def _build_entry(message: discord.Message, source: str = "live") -> dict:
         "source":     source,
         "guild":      str(message.guild) if message.guild else "DM",
         "guild_id":   message.guild.id if message.guild else None,
-        "guild_icon": message.guild.icon.key if message.guild and message.guild.icon else None,
+        "guild_icon": str(message.guild.icon) if message.guild and message.guild.icon else None,
         "channel":    str(message.channel),
         "channel_id": message.channel.id,
         "author":     str(message.author),
@@ -580,7 +580,7 @@ async def on_ready():
             log.warning("Could not resolve guild for channel %s — skipping server registration", cid)
             continue
         guild = channel.guild
-        guild_icon = guild.icon.key if guild.icon else None
+        guild_icon = str(guild.icon) if guild.icon else None
         await _ensure_verified_server(str(guild.id), display_name, guild_icon, guild.name)
 
     for cid in HISTORY_CHANNELS:
