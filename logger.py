@@ -314,7 +314,9 @@ async def on_ready():
     log.info("Watching %d channel(s):", len(CHANNEL_IDS))
     for cid, label in CHANNEL_LABELS.items():
         flag = " [history]" if cid in HISTORY_CHANNELS else ""
-        log.info("  %s — %s%s", cid, label, flag)
+        ch = client.get_channel(cid)
+        guild_name = ch.guild.name if ch and ch.guild else "NOT FOUND"
+        log.info("  %s — %s | guild: %s%s", cid, label, guild_name, flag)
 
     await get_pool()
 
