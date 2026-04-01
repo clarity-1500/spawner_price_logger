@@ -3,21 +3,25 @@
     {
       "id": 1392543634678611968,
       "label": "20B | DonutSMP Marketplace",
+      "display_name": "Donut SMP Marketplace",
       "check_history": true
     },
     {
       "id": 1414759023902986294,
       "label": "2B RN - Donut Orbit | Best Spawner Prices",
+      "display_name": "Donut Orbit",
       "check_history": true
     },
     {
       "id": 1373579452998746155,
       "label": "Adlantis x Ravvix SMP",
+      "display_name": "Adlantis x Ravvix SMP",
       "check_history": true
     },
     {
       "id": 1198679856544755804,
       "label": "DonutSMP Giveaways",
+      "display_name": "Donut SMP Giveaways",
       "check_history": true
     }
   ]

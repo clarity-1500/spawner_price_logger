@@ -29,9 +29,10 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 with open("config.json") as f:
     _cfg = json.load(f)
 
-CHANNEL_IDS:      set[int]       = {int(ch["id"]) for ch in _cfg["channels"]}
-CHANNEL_LABELS:   dict[int, str] = {int(ch["id"]): ch["label"] for ch in _cfg["channels"]}
-HISTORY_CHANNELS: set[int]       = {int(ch["id"]) for ch in _cfg["channels"] if ch.get("check_history")}
+CHANNEL_IDS:           set[int]       = {int(ch["id"]) for ch in _cfg["channels"]}
+CHANNEL_LABELS:        dict[int, str] = {int(ch["id"]): ch["label"]        for ch in _cfg["channels"]}
+CHANNEL_DISPLAY_NAMES: dict[int, str] = {int(ch["id"]): ch["display_name"] for ch in _cfg["channels"]}
+HISTORY_CHANNELS:      set[int]       = {int(ch["id"]) for ch in _cfg["channels"] if ch.get("check_history")}
 
 # ── Skeleton spawner price extraction ────────────────────────────────────────
 #
@@ -128,6 +129,19 @@ def _parse_price(digits: str, multiplier: str | None) -> int:
         elif mul == "m":
             value *= 1_000_000
     return int(value)
+
+
+def _fmt_price(n: int | None) -> str:
+    """Format a raw price int as human-readable string: 4400000 → '4.4M'."""
+    if n is None:
+        return "N/A"
+    if n >= 1_000_000:
+        v = n / 1_000_000
+        return f"{v:g}M"
+    if n >= 1_000:
+        v = n / 1_000
+        return f"{v:g}K"
+    return str(n)
 
 
 def _generic_skeleton_price(text: str) -> int | None:
@@ -324,6 +338,46 @@ async def _init_tables(pool: asyncpg.Pool) -> None:
             ON raw_price_log (message_id)
             WHERE message_id IS NOT NULL
         """)
+
+        # ── Market website tables ─────────────────────────────────────────────
+        # These are shared with discord_main_bot — CREATE IF NOT EXISTS is safe.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS spawner_market_servers (
+                guild_id     TEXT PRIMARY KEY,
+                display_name TEXT,
+                is_verified  BOOLEAN NOT NULL DEFAULT FALSE,
+                is_active    BOOLEAN NOT NULL DEFAULT TRUE,
+                added_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            ALTER TABLE spawner_market_servers
+            ADD COLUMN IF NOT EXISTS guild_icon TEXT
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS spawner_price_history (
+                id             BIGSERIAL PRIMARY KEY,
+                guild_id       TEXT NOT NULL,
+                sell_price_raw TEXT NOT NULL,
+                buy_price_raw  TEXT NOT NULL,
+                sell_price_num DOUBLE PRECISION NOT NULL,
+                buy_price_num  DOUBLE PRECISION NOT NULL,
+                recorded_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                source         TEXT NOT NULL DEFAULT 'logger'
+            )
+        """)
+        await conn.execute("""
+            ALTER TABLE spawner_price_history
+            ADD COLUMN IF NOT EXISTS guild_name TEXT
+        """)
+        await conn.execute("""
+            ALTER TABLE spawner_price_history
+            ADD COLUMN IF NOT EXISTS guild_icon TEXT
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sph_guild_time
+            ON spawner_price_history (guild_id, recorded_at DESC)
+        """)
     log.info("DB tables ready.")
 
 
@@ -379,6 +433,65 @@ async def _delete_price(log_id: int) -> None:
         await conn.execute("DELETE FROM spawner_prices WHERE raw_log_id = $1", log_id)
 
 
+# ── Market website bridge ─────────────────────────────────────────────────────
+
+async def _ensure_verified_server(guild_id: str, display_name: str,
+                                  guild_icon: str | None, guild_name: str) -> None:
+    """Register or update a server in spawner_market_servers as verified."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO spawner_market_servers
+                (guild_id, display_name, is_verified, is_active, guild_icon)
+            VALUES ($1, $2, TRUE, TRUE, $3)
+            ON CONFLICT (guild_id) DO UPDATE SET
+                display_name = EXCLUDED.display_name,
+                is_verified  = TRUE,
+                is_active    = TRUE,
+                guild_icon   = COALESCE(EXCLUDED.guild_icon, spawner_market_servers.guild_icon)
+        """, guild_id, display_name, guild_icon)
+        log.info("Verified server registered: %s (%s)", display_name, guild_id)
+
+
+async def _record_price_history(guild_id: str, guild_name: str, guild_icon: str | None,
+                                buy_price: int | None, sell_price: int | None) -> None:
+    """
+    Insert into spawner_price_history only when prices change from the last entry.
+    Skips if both prices are unchanged — avoids flooding the table on every restart.
+    """
+    if buy_price is None and sell_price is None:
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        last = await conn.fetchrow("""
+            SELECT sell_price_num, buy_price_num FROM spawner_price_history
+            WHERE guild_id = $1
+            ORDER BY recorded_at DESC LIMIT 1
+        """, guild_id)
+        if last:
+            same_sell = (last["sell_price_num"] == (sell_price or 0))
+            same_buy  = (last["buy_price_num"]  == (buy_price  or 0))
+            if same_sell and same_buy:
+                return  # no change — skip
+
+        sell_raw = _fmt_price(sell_price)
+        buy_raw  = _fmt_price(buy_price)
+        await conn.execute("""
+            INSERT INTO spawner_price_history
+                (guild_id, sell_price_raw, buy_price_raw,
+                 sell_price_num, buy_price_num,
+                 source, guild_name, guild_icon)
+            VALUES ($1, $2, $3, $4, $5, 'logger', $6, $7)
+        """,
+            guild_id,
+            sell_raw, buy_raw,
+            float(sell_price or 0), float(buy_price or 0),
+            guild_name, guild_icon,
+        )
+        log.info("Price history recorded for %s — buy: %s sell: %s",
+                 guild_name, buy_raw, sell_raw)
+
+
 # ── Discord client ────────────────────────────────────────────────────────────
 
 def _serialize_embed(embed: discord.Embed) -> dict:
@@ -400,6 +513,7 @@ def _build_entry(message: discord.Message, source: str = "live") -> dict:
         "source":     source,
         "guild":      str(message.guild) if message.guild else "DM",
         "guild_id":   message.guild.id if message.guild else None,
+        "guild_icon": message.guild.icon.key if message.guild and message.guild.icon else None,
         "channel":    str(message.channel),
         "channel_id": message.channel.id,
         "author":     str(message.author),
@@ -422,6 +536,15 @@ async def _process(entry: dict, event: str = "new") -> None:
 
     if buy or sell:
         await _upsert_price(entry["channel_id"], label, buy, sell, log_id)
+        # Record into price history for market chart + verified servers table
+        if entry.get("guild_id"):
+            await _record_price_history(
+                str(entry["guild_id"]),
+                entry["guild"],
+                entry.get("guild_icon"),
+                buy,
+                sell,
+            )
         parts = []
         if buy:
             parts.append(f"BUY ${buy:,}")
@@ -449,6 +572,16 @@ async def on_ready():
         log.info("  %s — %s | guild: %s%s", cid, label, guild_name, flag)
 
     await get_pool()
+
+    # Register all watched channels as verified servers in the market DB
+    for cid, display_name in CHANNEL_DISPLAY_NAMES.items():
+        channel = client.get_channel(cid)
+        if channel is None or channel.guild is None:
+            log.warning("Could not resolve guild for channel %s — skipping server registration", cid)
+            continue
+        guild = channel.guild
+        guild_icon = guild.icon.key if guild.icon else None
+        await _ensure_verified_server(str(guild.id), display_name, guild_icon, guild.name)
 
     for cid in HISTORY_CHANNELS:
         channel = client.get_channel(cid)
