@@ -1,7 +1,7 @@
 """
 Spawner Price Logger — Phase 1
 Watches configured channels and logs every message + embed to price_log.jsonl.
-Add channels in config.json — no code changes needed.
+Add/remove channels in config.json — no code changes needed.
 """
 
 import os
@@ -19,6 +19,7 @@ with open("config.json") as f:
 
 CHANNEL_IDS: set[int] = {int(ch["id"]) for ch in _cfg["channels"]}
 CHANNEL_LABELS: dict[int, str] = {int(ch["id"]): ch["label"] for ch in _cfg["channels"]}
+HISTORY_CHANNELS: set[int] = {int(ch["id"]) for ch in _cfg["channels"] if ch.get("check_history")}
 
 LOG_FILE = "price_log.jsonl"
 
@@ -41,27 +42,13 @@ def _log(entry: dict) -> None:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     label = CHANNEL_LABELS.get(entry["channel_id"], str(entry["channel_id"]))
     kind  = "EMBED" if entry["embeds"] else "MSG"
-    print(f"[{entry['timestamp']}] {label} — {kind}: {(entry['content'] or '(no content)')[:100]}")
+    preview = (entry["content"] or "(no content)")[:100]
+    print(f"[{entry['timestamp']}] {label} — {kind}: {preview}")
 
 
-client = discord.Client()
-
-
-@client.event
-async def on_ready():
-    print(f"Logged in as {client.user}")
-    print(f"Watching {len(CHANNEL_IDS)} channel(s):")
-    for cid, label in CHANNEL_LABELS.items():
-        print(f"  {cid} — {label}")
-    print(f"Logging to {LOG_FILE}")
-
-
-@client.event
-async def on_message(message: discord.Message):
-    if message.channel.id not in CHANNEL_IDS:
-        return
-
-    entry = {
+def _build_entry(message: discord.Message, source: str = "live") -> dict:
+    return {
+        "source":     source,
         "timestamp":  datetime.datetime.utcnow().isoformat(),
         "guild":      str(message.guild) if message.guild else "DM",
         "guild_id":   message.guild.id if message.guild else None,
@@ -73,7 +60,37 @@ async def on_message(message: discord.Message):
         "content":    message.content,
         "embeds":     [_serialize_embed(e) for e in message.embeds],
     }
-    _log(entry)
+
+
+client = discord.Client()
+
+
+@client.event
+async def on_ready():
+    print(f"Logged in as {client.user}")
+    print(f"Watching {len(CHANNEL_IDS)} channel(s):")
+    for cid, label in CHANNEL_LABELS.items():
+        flag = " [history]" if cid in HISTORY_CHANNELS else ""
+        print(f"  {cid} — {label}{flag}")
+    print(f"Logging to {LOG_FILE}\n")
+
+    # For channels that don't delete messages, fetch the last 2 on startup
+    for cid in HISTORY_CHANNELS:
+        channel = client.get_channel(cid)
+        if channel is None:
+            print(f"WARNING: could not find history channel {cid} — not in guild?")
+            continue
+        print(f"Fetching last 2 messages from {CHANNEL_LABELS.get(cid, cid)}...")
+        async for message in channel.history(limit=2):
+            entry = _build_entry(message, source="history")
+            _log(entry)
+
+
+@client.event
+async def on_message(message: discord.Message):
+    if message.channel.id not in CHANNEL_IDS:
+        return
+    _log(_build_entry(message, source="live"))
 
 
 client.run(TOKEN)

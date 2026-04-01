@@ -1,12 +1,24 @@
 {
   "channels": [
     {
-      "id": 000000000000000000,
-      "label": "Server 1 — #spawner-prices"
+      "id": 1392543634678611968,
+      "label": "Server 1",
+      "check_history": false
     },
     {
-      "id": 000000000000000000,
-      "label": "Server 2 — #trading"
+      "id": 1414759023902986294,
+      "label": "Server 2",
+      "check_history": false
+    },
+    {
+      "id": 1373579452998746155,
+      "label": "Server 3",
+      "check_history": false
+    },
+    {
+      "id": 1198679856544755804,
+      "label": "Server 4 (no deletes — check latest 2 messages)",
+      "check_history": true
     }
   ]
 }
