@@ -479,4 +479,28 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
     await _process(_build_entry(after, source="edit"), event="edit")
 
 
+@client.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
+    """
+    Catches edits on messages NOT in Discord's cache (e.g. posted before bot started,
+    outside the 10-message history window). on_message_edit handles cached messages,
+    so skip here if the message was cached to avoid double-processing.
+    """
+    if payload.channel_id not in CHANNEL_IDS:
+        return
+    if payload.cached_message is not None:
+        # on_message_edit already fired for this — skip
+        return
+    channel = client.get_channel(payload.channel_id)
+    if channel is None:
+        return
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        log.warning("Could not fetch edited message %s in channel %s",
+                    payload.message_id, payload.channel_id)
+        return
+    await _process(_build_entry(message, source="edit"), event="edit")
+
+
 client.run(TOKEN)
