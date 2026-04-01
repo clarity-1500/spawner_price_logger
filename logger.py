@@ -197,7 +197,6 @@ async def _init_tables(pool: asyncpg.Pool) -> None:
         await conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_spawner_prices_raw_log_id
             ON spawner_prices (raw_log_id)
-            WHERE raw_log_id IS NOT NULL
         """)
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_raw_price_log_message_id
